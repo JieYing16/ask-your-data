@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ask Your Data</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --border: #262b38;
+    --text: #e6e8ee;
+    --muted: #8a90a2;
+    --accent: #6c8cff;
+    --accent-dim: #3a4a8a;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 48px 24px 80px;
+  }
+  header h1 {
+    font-size: 28px;
+    margin: 0 0 6px;
+  }
+  header p {
+    color: var(--muted);
+    margin: 0 0 32px;
+    font-size: 15px;
+  }
+  .schema-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 28px;
+  }
+  .pill {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  form {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  input[type="text"] {
+    flex: 1;
+    padding: 14px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font-size: 15px;
+    outline: none;
+  }
+  input[type="text"]:focus {
+    border-color: var(--accent);
+  }
+  button {
+    padding: 0 22px;
+    border-radius: 10px;
+    border: none;
+    background: var(--accent);
+    color: white;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: var(--accent-dim);
+    cursor: not-allowed;
+  }
+  .examples {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 36px;
+  }
+  .example {
+    font-size: 13px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .example:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  #result { display: none; }
+  #result.visible { display: block; }
+  .answer {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 22px;
+    font-size: 16px;
+    line-height: 1.55;
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+  }
+  details {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  summary {
+    padding: 12px 18px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--muted);
+    user-select: none;
+  }
+  pre {
+    margin: 0;
+    padding: 0 18px 18px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: #b9c3ff;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+  }
+  tbody tr:hover { background: #1b1f2b; }
+  .row-note {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 8px 2px 0;
+  }
+  .status {
+    font-size: 14px;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+  .error {
+    color: #ff8a8a;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Ask Your Data</h1>
+    <p>Natural-language questions over the Chinook music store database — Claude writes the SQL, runs it, and explains the result.</p>
+  </header>
+
+  <div class="schema-row" id="schema-row"></div>
+
+  <form id="ask-form">
+    <input type="text" id="question" placeholder="e.g. Which 5 genres generate the most revenue?" autocomplete="off" />
+    <button type="submit" id="ask-button">Ask</button>
+  </form>
+
+  <div class="examples" id="examples"></div>
+
+  <div class="status" id="status"></div>
+
+  <div id="result">
+    <div class="answer" id="answer"></div>
+    <details id="sql-details" open>
+      <summary>SQL query</summary>
+      <pre id="sql-text"></pre>
+    </details>
+    <div class="table-wrap">
+      <table id="result-table">
+        <thead id="table-head"></thead>
+        <tbody id="table-body"></tbody>
+      </table>
+    </div>
+    <div class="row-note" id="row-note"></div>
+  </div>
+</main>
+
+<script>
+const EXAMPLES = [
+  "Which 5 genres generate the most revenue?",
+  "Who are the top 10 customers by total spend?",
+  "What is the average invoice total by country?",
+  "Which employee has the most customers assigned to them?",
+  "What are the 10 longest tracks in the catalog?",
+];
+
+const examplesEl = document.getElementById("examples");
+EXAMPLES.forEach((q) => {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "example";
+  btn.textContent = q;
+  btn.addEventListener("click", () => {
+    document.getElementById("question").value = q;
+    document.getElementById("ask-form").dispatchEvent(new Event("submit"));
+  });
+  examplesEl.appendChild(btn);
+});
+
+fetch("/api/schema")
+  .then((r) => r.json())
+  .then((data) => {
+    const row = document.getElementById("schema-row");
+    data.tables.forEach((t) => {
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      pill.textContent = t;
+      row.appendChild(pill);
+    });
+  })
+  .catch(() => {});
+
+const form = document.getElementById("ask-form");
+const button = document.getElementById("ask-button");
+const statusEl = document.getElementById("status");
+const resultEl = document.getElementById("result");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = document.getElementById("question").value.trim();
+  if (!question) return;
+
+  button.disabled = true;
+  resultEl.classList.remove("visible");
+  statusEl.textContent = "Thinking…";
+  statusEl.classList.remove("error");
+
+  try {
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+
+    statusEl.textContent = "";
+    document.getElementById("answer").textContent = data.answer;
+    document.getElementById("sql-text").textContent = data.sql || "(no query executed)";
+
+    const head = document.getElementById("table-head");
+    const body = document.getElementById("table-body");
+    head.innerHTML = "";
+    body.innerHTML = "";
+
+    if (data.columns && data.columns.length) {
+      const tr = document.createElement("tr");
+      data.columns.forEach((c) => {
+        const th = document.createElement("th");
+        th.textContent = c;
+        tr.appendChild(th);
+      });
+      head.appendChild(tr);
+
+      data.rows.forEach((row) => {
+        const tr = document.createElement("tr");
+        row.forEach((cell) => {
+          const td = document.createElement("td");
+          td.textContent = cell === null ? "NULL" : cell;
+          tr.appendChild(td);
+        });
+        body.appendChild(tr);
+      });
+
+      document.getElementById("row-note").textContent =
+        `${data.row_count} row${data.row_count === 1 ? "" : "s"} returned` +
+        (data.row_count > data.rows.length ? ` (showing first ${data.rows.length})` : "");
+    } else {
+      document.getElementById("row-note").textContent = "";
+    }
+
+    resultEl.classList.add("visible");
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.classList.add("error");
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
