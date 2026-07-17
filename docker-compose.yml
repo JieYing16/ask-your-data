@@ -4,5 +4,12 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-opus-4-8}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+    extra_hosts:
+      # Lets the container reach Ollama running on the host machine (needed on Linux;
+      # Docker Desktop on Mac/Windows resolves this automatically).
+      - "host.docker.internal:host-gateway"
