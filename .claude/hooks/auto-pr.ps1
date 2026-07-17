@@ -56,9 +56,12 @@ $diff
 "@
         $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
         try {
-            # Force stdin closed rather than inheriting the hook's own stdin pipe,
-            # which otherwise makes claude.exe stall for a few seconds probing it.
-            $result = $null | claude -p $prompt --tools "" --output-format text `
+            # Pipe the prompt over stdin rather than passing it as a positional
+            # argument: a diff-sized prompt is big enough to break as a native
+            # command-line argument, and piping also avoids inheriting the
+            # hook's own stdin pipe (which otherwise makes claude.exe stall for
+            # a few seconds probing it).
+            $result = $prompt | claude -p --tools "" --output-format text `
                 --max-budget-usd 0.50 --no-session-persistence 2>$null
         } finally {
             Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
