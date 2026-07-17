@@ -1,22 +1,16 @@
 # Auto-PR hook (Stop event). See settings.local.json for how this is wired up.
 #
-# On a dirty tree: opens a PR for whatever changed (drafting the description
-# from the diff and requesting an automated code review, both via headless
-# `claude -p` calls), or, if already on an open auto-PR branch, just pushes
-# more commits to it. The review only runs once, at PR creation, not on every
-# push. None of this ever prompts for confirmation.
+# On a dirty tree: opens a PR for whatever changed, drafting the description
+# and requesting a code review via a local Ollama model (free, no API calls),
+# or, if already on an open auto-PR branch, just pushes more commits to it.
+# The review only runs once, at PR creation, not on every push. None of this
+# ever prompts for confirmation.
 
-$reviewEffort = 'high'
-$maxSpendUsd = 2.00
+$ollamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { 'qwen2.5-coder:7b' }
+$ollamaHost = if ($env:OLLAMA_HOST) { $env:OLLAMA_HOST } else { 'http://localhost:11434' }
 
 function Emit($msg) {
     (@{ systemMessage = $msg } | ConvertTo-Json -Compress)
-}
-
-# A nested `claude -p` call below is itself a full session and will hit its own
-# Stop event. This guard stops that nested run from re-entering this script.
-if ($env:CLAUDE_AUTO_PR_HOOK_RUNNING -eq '1') {
-    exit 0
 }
 
 $statusLines = git status --porcelain
@@ -30,17 +24,54 @@ if ($branch -ne 'master' -and $branch -notlike 'claude/auto-*') {
     exit 0
 }
 
+function Invoke-Ollama($systemPrompt, $userPrompt, $schema) {
+    $payload = @{
+        model    = $ollamaModel
+        messages = @(
+            @{ role = 'system'; content = $systemPrompt }
+            @{ role = 'user'; content = $userPrompt }
+        )
+        stream   = $false
+    }
+    # A bare "json" format forces valid JSON syntax but, on a 7B model, tends to
+    # suppress the reasoning that finds real issues -- callers that need
+    # structured output should do a free-form pass first and structure it in a
+    # second call (see Invoke-CodeReview), passing the schema only there.
+    if ($schema) { $payload['format'] = $schema }
+    try {
+        $resp = Invoke-RestMethod -Uri "$ollamaHost/api/chat" -Method Post `
+            -Body ($payload | ConvertTo-Json -Depth 10 -Compress) -ContentType 'application/json' `
+            -TimeoutSec 180
+        return $resp.message.content
+    } catch {
+        return $null
+    }
+}
+
+$script:findingSchema = @{
+    type  = 'array'
+    items = @{
+        type       = 'object'
+        properties = @{
+            line              = @{ type = 'integer' }
+            summary           = @{ type = 'string' }
+            failure_scenario  = @{ type = 'string' }
+        }
+        required   = @('line', 'summary', 'failure_scenario')
+    }
+}
+
 function New-PrBody($diff) {
     try {
-        $maxChars = 6000
+        $maxChars = 12000
         $truncated = $diff.Length -gt $maxChars
         if ($truncated) {
             $diff = $diff.Substring(0, $maxChars)
         }
         $note = if ($truncated) { ' (truncated)' } else { '' }
-        $prompt = @"
-Draft a concise GitHub pull request description in Markdown for the diff below.
-Use exactly these three sections, in this order:
+        $system = 'You draft concise, accurate GitHub pull request descriptions from diffs. Output only the Markdown body -- no title, no text outside the requested sections.'
+        $user = @"
+Draft a PR description for the diff below. Use exactly these three sections, in this order:
 
 ## Purpose
 What this change does and why.
@@ -51,27 +82,12 @@ What could break, the blast radius, and how to roll back if needed.
 ## Issues Addressed
 The concrete problem or gap this solves. If none is evident from the diff, say so plainly.
 
-Do not include a title or any text outside these three sections.
-
 Diff${note}:
 $diff
 "@
-        $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
-        try {
-            # Pipe the prompt over stdin rather than passing it as a positional
-            # argument: a diff-sized prompt is big enough to break as a native
-            # command-line argument, and piping also avoids inheriting the
-            # hook's own stdin pipe (which otherwise makes claude.exe stall for
-            # a few seconds probing it).
-            $result = $prompt | claude -p --tools "" --output-format text `
-                --max-budget-usd 0.50 --no-session-persistence 2>$null
-        } finally {
-            Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
-        }
-        if ($LASTEXITCODE -ne 0 -or -not $result) {
-            return $null
-        }
-        $text = ($result -join "`n").Trim()
+        $text = Invoke-Ollama -systemPrompt $system -userPrompt $user
+        if (-not $text) { return $null }
+        $text = $text.Trim()
         if (-not $text) { return $null }
         return $text
     } catch {
@@ -79,22 +95,77 @@ $diff
     }
 }
 
-function Invoke-CodeReview {
-    try {
-        $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
-        try {
-            $null | claude -p "/code-review $reviewEffort --comment" `
-                --append-system-prompt "You are a rigorous senior code reviewer holding this PR to a high standard of clean, effective, maintainable code. Flag anything that falls short." `
-                --permission-mode bypassPermissions `
-                --output-format text `
-                --max-budget-usd $maxSpendUsd `
-                --no-session-persistence *>$null
-        } finally {
-            Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
+function Get-CommentableLines($diffText) {
+    # Maps out which new-file line numbers actually appear in the diff, since
+    # GitHub's inline PR comment API rejects lines outside it.
+    $result = @{}
+    $newLineNum = 0
+    foreach ($line in ($diffText -split "`n")) {
+        if ($line -match '^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@') {
+            $newLineNum = [int]$matches[1]
+            continue
         }
-    } catch {
-        # Best-effort: a failed review pass shouldn't be treated as a hook failure.
+        if ($line.StartsWith('+++') -or $line.StartsWith('---')) { continue }
+        if ($line.StartsWith('+') -or $line.StartsWith(' ')) {
+            $result[$newLineNum] = $true
+            $newLineNum++
+        }
+        # '-' lines are deletions: absent from the new file, so they don't
+        # advance the new-line counter and can't be commented on via 'side=RIGHT'.
     }
+    return $result
+}
+
+function Invoke-CodeReview($prNumber, $diffBase, $headSha, $repoSlug) {
+    $maxCharsPerFile = 12000
+    $postedCount = 0
+    $files = @(git diff --name-only "$diffBase...HEAD")
+
+    foreach ($file in $files) {
+        $fileDiff = (git diff "$diffBase...HEAD" -- $file | Out-String)
+        if (-not $fileDiff.Trim()) { continue }
+
+        $commentable = Get-CommentableLines $fileDiff
+        if ($commentable.Count -eq 0) { continue }
+
+        $truncated = $fileDiff.Length -gt $maxCharsPerFile
+        if ($truncated) { $fileDiff = $fileDiff.Substring(0, $maxCharsPerFile) }
+        $fileNote = if ($truncated) { ' (diff truncated)' } else { '' }
+
+        # Stage 1: free-form analysis. Unconstrained generation finds real
+        # issues; a JSON-schema-constrained first pass on a 7B model tends to
+        # come back empty even on obviously buggy diffs (verified experimentally).
+        $analysisSystem = 'You are a rigorous senior code reviewer holding this change to a high standard of clean, effective, maintainable code. Look hard for concrete correctness bugs: missing validation, race conditions, unchecked preconditions, error handling gaps, resource leaks. Do not invent issues that are not there.'
+        $analysisUser = "File: $file$fileNote`n`nDiff:`n$fileDiff`n`nList concrete issues, plain text, each tied to a specific new-file line number from the diff. If there are none, say so."
+        $analysis = Invoke-Ollama -systemPrompt $analysisSystem -userPrompt $analysisUser
+        if (-not $analysis) { continue }
+
+        # Stage 2: structure the stage-1 analysis into the required JSON shape.
+        $structureSystem = 'Convert a code review analysis into a strict JSON array. Each element: {"line": <int, a new-file line number from the diff>, "summary": <short string>, "failure_scenario": <string>}. Only include items that reference a concrete line number. If the analysis has no findings, return [].'
+        $structureUser = "Diff:`n$fileDiff`n`nAnalysis to convert:`n$analysis"
+        $raw = Invoke-Ollama -systemPrompt $structureSystem -userPrompt $structureUser -schema $script:findingSchema
+        if (-not $raw) { continue }
+
+        try {
+            $findings = @($raw | ConvertFrom-Json)
+        } catch {
+            continue
+        }
+
+        foreach ($finding in $findings) {
+            if (-not $finding.line) { continue }
+            $lineNum = [int]$finding.line
+            if (-not $commentable.ContainsKey($lineNum)) { continue }
+            if (-not $finding.summary) { continue }
+
+            $body = "**$($finding.summary)**`n`n$($finding.failure_scenario)`n`n_Posted by the free local code-review agent ($ollamaModel via Ollama)._"
+            gh api "repos/$repoSlug/pulls/$prNumber/comments" `
+                -f "commit_id=$headSha" -f "path=$file" -F "line=$lineNum" -f "side=RIGHT" -f "body=$body" *>$null
+            if ($LASTEXITCODE -eq 0) { $postedCount++ }
+        }
+    }
+
+    return $postedCount
 }
 
 try {
@@ -149,8 +220,15 @@ try {
         }
         gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef *>$null
         if ($LASTEXITCODE -ne 0) { throw "gh pr create failed for $branch (branch was pushed)" }
-        Invoke-CodeReview
-        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and requested a code review.")
+
+        $prNumber = gh pr view $branch --json number -q .number 2>$null
+        $headSha = (git rev-parse HEAD).Trim()
+        $repoSlug = gh repo view --json nameWithOwner -q .nameWithOwner 2>$null
+        $reviewCount = 0
+        if ($prNumber -and $repoSlug) {
+            $reviewCount = Invoke-CodeReview -prNumber $prNumber -diffBase $diffBase -headSha $headSha -repoSlug $repoSlug
+        }
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).")
     } else {
         Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
     }
