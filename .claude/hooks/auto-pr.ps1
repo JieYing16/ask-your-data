@@ -1,0 +1,141 @@
+# Auto-PR hook (Stop event). See settings.local.json for how this is wired up.
+#
+# On a dirty tree: opens (or updates) a PR for whatever changed, drafts the PR
+# description from the diff, and requests an automated code review — all via
+# headless `claude -p` calls, so this never prompts for confirmation.
+
+$reviewEffort = 'high'
+$maxSpendUsd = 2.00
+
+function Emit($msg) {
+    (@{ systemMessage = $msg } | ConvertTo-Json -Compress)
+}
+
+# A nested `claude -p` call below is itself a full session and will hit its own
+# Stop event. This guard stops that nested run from re-entering this script.
+if ($env:CLAUDE_AUTO_PR_HOOK_RUNNING -eq '1') {
+    exit 0
+}
+
+$statusLines = git status --porcelain
+if (-not $statusLines) {
+    exit 0
+}
+
+$branch = (git rev-parse --abbrev-ref HEAD).Trim()
+
+if ($branch -ne 'master' -and $branch -notlike 'claude/auto-*') {
+    exit 0
+}
+
+function New-PrBody($diff) {
+    try {
+        $maxChars = 6000
+        $truncated = $diff.Length -gt $maxChars
+        if ($truncated) {
+            $diff = $diff.Substring(0, $maxChars)
+        }
+        $note = if ($truncated) { ' (truncated)' } else { '' }
+        $prompt = @"
+Draft a concise GitHub pull request description in Markdown for the diff below.
+Use exactly these three sections, in this order:
+
+## Purpose
+What this change does and why.
+
+## Risk
+What could break, the blast radius, and how to roll back if needed.
+
+## Issues Addressed
+The concrete problem or gap this solves. If none is evident from the diff, say so plainly.
+
+Do not include a title or any text outside these three sections.
+
+Diff${note}:
+$diff
+"@
+        $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
+        try {
+            $result = claude -p $prompt --tools "" --output-format text `
+                --max-budget-usd 0.50 --no-session-persistence 2>$null
+        } finally {
+            Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
+        }
+        if ($LASTEXITCODE -ne 0 -or -not $result) {
+            return $null
+        }
+        $text = ($result -join "`n").Trim()
+        if (-not $text) { return $null }
+        return $text
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-CodeReview {
+    try {
+        $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
+        try {
+            claude -p "/code-review $reviewEffort --comment" `
+                --append-system-prompt "You are a rigorous senior code reviewer holding this PR to a high standard of clean, effective, maintainable code. Flag anything that falls short." `
+                --permission-mode bypassPermissions `
+                --output-format text `
+                --max-budget-usd $maxSpendUsd `
+                --no-session-persistence *>$null
+        } finally {
+            Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Best-effort: a failed review pass shouldn't be treated as a hook failure.
+    }
+}
+
+try {
+    $needsNewBranch = ($branch -eq 'master')
+
+    if (-not $needsNewBranch) {
+        # Only keep pushing to this branch if it still has an open PR; otherwise cut a fresh one.
+        $prState = gh pr view $branch --json state -q .state 2>$null
+        if ($LASTEXITCODE -ne 0 -or $prState -ne 'OPEN') {
+            git checkout master *>$null
+            if ($LASTEXITCODE -ne 0) { throw "could not switch back to master to cut a fresh branch" }
+            $needsNewBranch = $true
+        }
+    }
+
+    $baseRef = 'master'
+
+    if ($needsNewBranch) {
+        $branch = "claude/auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        git checkout -b $branch *>$null
+        if ($LASTEXITCODE -ne 0) { throw "could not create branch $branch" }
+    }
+
+    git add -A
+    git commit -m "Automated commit from Claude Code session" *>$null
+    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+
+    if ($needsNewBranch) {
+        git push -u origin $branch *>$null
+    } else {
+        git push *>$null
+    }
+    if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
+
+    if ($needsNewBranch) {
+        $diff = (git diff "$baseRef...HEAD" | Out-String)
+        $body = New-PrBody $diff
+        if (-not $body) {
+            $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
+        }
+        gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef *>$null
+        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed for $branch (branch was pushed)" }
+        Invoke-CodeReview
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and requested a code review.")
+    } else {
+        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
+    }
+}
+catch {
+    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)")
+}
