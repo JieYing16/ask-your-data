@@ -1,8 +1,10 @@
 # Auto-PR hook (Stop event). See settings.local.json for how this is wired up.
 #
-# On a dirty tree: opens (or updates) a PR for whatever changed, drafts the PR
-# description from the diff, and requests an automated code review — all via
-# headless `claude -p` calls, so this never prompts for confirmation.
+# On a dirty tree: opens a PR for whatever changed (drafting the description
+# from the diff and requesting an automated code review, both via headless
+# `claude -p` calls), or, if already on an open auto-PR branch, just pushes
+# more commits to it. The review only runs once, at PR creation, not on every
+# push. None of this ever prompts for confirmation.
 
 $reviewEffort = 'high'
 $maxSpendUsd = 2.00
@@ -99,11 +101,17 @@ try {
     $needsNewBranch = ($branch -eq 'master')
 
     if (-not $needsNewBranch) {
-        # Only keep pushing to this branch if it still has an open PR; otherwise cut a fresh one.
+        # Only cut a fresh branch on a *definitive* non-open state. A failed gh
+        # call (auth/network/rate-limit) is inconclusive, not evidence the PR is
+        # closed -- treat it as "still open" and keep pushing here, rather than
+        # risk orphaning a real open PR behind a duplicate branch.
         $prState = gh pr view $branch --json state -q .state 2>$null
-        if ($LASTEXITCODE -ne 0 -or $prState -ne 'OPEN') {
+        $prCheckFailed = ($LASTEXITCODE -ne 0)
+        if (-not $prCheckFailed -and $prState -ne 'OPEN') {
+            $staleBranch = $branch
             git checkout master *>$null
             if ($LASTEXITCODE -ne 0) { throw "could not switch back to master to cut a fresh branch" }
+            git branch -D $staleBranch *>$null
             $needsNewBranch = $true
         }
     }
@@ -111,6 +119,12 @@ try {
     $baseRef = 'master'
 
     if ($needsNewBranch) {
+        # Read-only; safe even with a dirty tree. Lets the PR description (and,
+        # when nothing local conflicts, the branch point) reflect current master
+        # instead of a possibly-stale local copy.
+        git fetch origin master *>$null
+        $diffBase = if ($LASTEXITCODE -eq 0) { 'origin/master' } else { $baseRef }
+
         $branch = "claude/auto-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         git checkout -b $branch *>$null
         if ($LASTEXITCODE -ne 0) { throw "could not create branch $branch" }
@@ -128,7 +142,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
 
     if ($needsNewBranch) {
-        $diff = (git diff "$baseRef...HEAD" | Out-String)
+        $diff = (git diff "$diffBase...HEAD" | Out-String)
         $body = New-PrBody $diff
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
