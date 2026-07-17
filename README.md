@@ -5,8 +5,9 @@
 ![DuckDB](https://img.shields.io/badge/DuckDB-1.5-FFF000?logo=duckdb&logoColor=black)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 ![Claude](https://img.shields.io/badge/LLM-Claude-D97757?logo=anthropic&logoColor=white)
+![Ollama](https://img.shields.io/badge/LLM-Ollama%20(free)-000000?logo=ollama&logoColor=white)
 
-A natural-language interface over a real relational database. Ask a question in plain English, Claude writes and runs the SQL, and you get back a plain-language answer alongside the exact query and result set it used.
+A natural-language interface over a real relational database. Ask a question in plain English, the LLM writes and runs the SQL, and you get back a plain-language answer alongside the exact query and result set it used. Works with either the Claude API or a free, local Ollama model.
 
 ```
 "Which 5 genres generate the most revenue?"
@@ -21,7 +22,7 @@ Claude (tool use) ──► execute_sql("SELECT g.Name, SUM(...) ...")
 
 ## Stack
 
-- **LLM**: Claude (Anthropic API), driving a tool-use loop — it writes SQL, we execute it, it reads the results back and explains them.
+- **LLM**: pluggable via `LLM_PROVIDER` — either Claude (Anthropic API, paid) or [Ollama](https://ollama.com) (free, runs locally, no API key). Either way, the model drives the same tool-use loop: it writes SQL, we execute it, it reads the results back and explains them.
 - **Database**: [Chinook](https://github.com/lerocha/chinook-database) — a real, well-known relational dataset (11 tables: customers, invoices, tracks, artists, employees, etc.), queried through **DuckDB**'s SQLite scanner.
 - **Backend**: FastAPI (`/api/ask`, `/api/schema`, `/api/health`).
 - **Frontend**: a single static HTML page — no build step.
@@ -33,9 +34,20 @@ The point of this project is to demonstrate an LLM-powered "ask your data" patte
 
 ## Quickstart
 
+First, pick an LLM backend:
+
+- **Claude (Anthropic API)** — best answer quality, needs a paid API key.
+- **Ollama** — completely free, runs locally, no account or API key. Slightly weaker SQL generation than Claude, but works fine for this dataset. Requires [installing Ollama](https://ollama.com/download) and pulling a tool-calling-capable model (a few GB download), e.g.:
+  ```bash
+  ollama pull llama3.1
+  ```
+  Then make sure the Ollama server is running (`ollama serve`, or just open the Ollama app — it runs in the background).
+
+Both options use the same app; you just flip `LLM_PROVIDER` in `.env`.
+
 ### Option A — Docker (recommended)
 
-1. **Get an API key** from [console.anthropic.com](https://console.anthropic.com/) if you don't have one.
+1. **If using Claude**, get an API key from [console.anthropic.com](https://console.anthropic.com/). If using Ollama, make sure it's installed, a model is pulled, and the server is running on the host (see above).
 2. **Clone and enter the repo:**
    ```bash
    git clone https://github.com/JieYing16/ask-your-data.git
@@ -45,10 +57,9 @@ The point of this project is to demonstrate an LLM-powered "ask your data" patte
    ```bash
    cp .env.example .env
    ```
-4. **Add your key** — open `.env` and set:
-   ```
-   ANTHROPIC_API_KEY=sk-ant-your-key-here
-   ```
+4. **Configure `.env`:**
+   - For Claude: leave `LLM_PROVIDER=anthropic` and set `ANTHROPIC_API_KEY=sk-ant-your-key-here`.
+   - For Ollama: set `LLM_PROVIDER=ollama`. The default `OLLAMA_HOST=http://host.docker.internal:11434` already points the container at your host's Ollama server, so no other changes are needed (adjust `OLLAMA_MODEL` if you pulled a different model).
 5. **Build and start the container:**
    ```bash
    docker compose up --build
@@ -71,13 +82,22 @@ The point of this project is to demonstrate an LLM-powered "ask your data" patte
    ```bash
    pip install -r requirements.txt
    ```
-5. **Set your API key** for the current shell session:
-   ```bash
-   export ANTHROPIC_API_KEY=sk-ant-your-key-here     # macOS/Linux/Git Bash
-   ```
-   ```powershell
-   $env:ANTHROPIC_API_KEY = "sk-ant-your-key-here"   # PowerShell
-   ```
+5. **Set your environment variables** for the current shell session:
+   - For Claude:
+     ```bash
+     export ANTHROPIC_API_KEY=sk-ant-your-key-here     # macOS/Linux/Git Bash
+     ```
+     ```powershell
+     $env:ANTHROPIC_API_KEY = "sk-ant-your-key-here"   # PowerShell
+     ```
+   - For Ollama (with Ollama already installed, a model pulled, and `ollama serve` running):
+     ```bash
+     export LLM_PROVIDER=ollama                        # macOS/Linux/Git Bash
+     ```
+     ```powershell
+     $env:LLM_PROVIDER = "ollama"                      # PowerShell
+     ```
+     `OLLAMA_HOST` defaults to `http://localhost:11434` and `OLLAMA_MODEL` to `llama3.1`, which is right for a local, non-Docker setup.
 6. **Start the server:**
    ```bash
    uvicorn app.main:app --reload
@@ -85,66 +105,13 @@ The point of this project is to demonstrate an LLM-powered "ask your data" patte
 7. **Open the app** at [http://localhost:8000](http://localhost:8000).
 8. **Stop it** with `Ctrl+C`.
 
-> Optional: set `ANTHROPIC_MODEL` (defaults to `claude-opus-4-8`) to try a cheaper/faster model, e.g. `claude-haiku-4-5`.
-
-## Optional: Auto-PR hook with Ollama
-
-The auto-PR hook can use a local Ollama instance for free code reviews and PR description generation.
-
-### Installation
-
-1. **Install Ollama**: Download from https://ollama.ai
-2. **Start the Ollama server**:
-   ```bash
-   ollama serve
-   ```
-3. **Pull a model** (if not already present):
-   ```bash
-   ollama pull qwen2.5-coder:7b  # Default model
-   # Or use a larger model if you have the resources:
-   ollama pull mistral:latest
-   ```
-
-### Configuration
-
-Set environment variables to customize the hook behavior:
-
-```powershell
-# Use a different model
-$env:OLLAMA_MODEL = "mistral:latest"
-
-# Connect to a remote Ollama instance
-$env:OLLAMA_HOST = "http://192.168.1.100:11434"
-
-# Enable debug logging
-$env:CLAUDE_AUTO_PR_DEBUG = "true"
-```
-
-### Fallback options
-
-If Ollama is unavailable, the hook will:
-- Generate a generic PR description
-- Skip code review entirely
-- Log warnings about what was skipped
-
-To enable OpenAI as a fallback (paid):
-
-```powershell
-$env:OPENAI_API_KEY = "sk-..."
-```
-
-### Troubleshooting
-
-- **"Ollama server not accessible"**: Verify `ollama serve` is running
-- **"Model not found"**: Run `ollama pull <model-name>`
-- **Slow code review**: Use a smaller model like `qwen2.5-coder:7b` instead of larger ones
-- **Out of memory**: Reduce the model size or increase available VRAM
+> Optional: set `ANTHROPIC_MODEL` (defaults to `claude-opus-4-8`) to try a cheaper/faster model, e.g. `claude-haiku-4-5`. If using Ollama, set `OLLAMA_MODEL` to any tool-calling-capable model you've pulled (e.g. `qwen2.5`, `mistral-nemo`).
 
 ## Walkthrough
 
-1. **Load the page.** You'll see a row of pills listing the 11 available tables (Customer, Invoice, Track, Artist, ...) — that's the schema Claude has access to — plus a row of clickable example questions.
+1. **Load the page.** You'll see a row of pills listing the 11 available tables (Customer, Invoice, Track, Artist, ...) — that's the schema the model has access to — plus a row of clickable example questions.
 2. **Ask a question.** Type something into the box (or click an example chip) and hit **Ask** — e.g. *"Which 5 genres generate the most revenue?"*
-3. **Claude works in the background.** It writes a SQL query, the app runs it against the database, and Claude reads the real result back before answering — you'll see a brief "Thinking…" state while this happens.
+3. **The model works in the background.** It writes a SQL query, the app runs it against the database, and the model reads the real result back before answering — you'll see a brief "Thinking…" state while this happens.
 4. **Read the answer.** A plain-English answer appears first, citing the actual numbers returned.
 5. **Check the SQL.** Below the answer, an expandable **SQL query** panel shows exactly what ran — this is what makes the answer verifiable rather than a black box.
 6. **Check the data.** Below that, a results table shows the raw rows the answer was based on (capped at 200 rows, with a note if more were truncated).
@@ -160,9 +127,9 @@ Good questions to try (these force joins/aggregations, which shows off the SQL g
 ## How it works
 
 1. The full database schema (DDL, with primary/foreign keys) is embedded in the system prompt.
-2. Claude is given one tool, `execute_sql`, and told to use it before answering.
+2. The model is given one tool, `execute_sql`, and told to use it before answering. `LLM_PROVIDER` selects which backend drives this loop — Claude via the Anthropic API, or a local model via Ollama — both using the same tool definition, system prompt, and validation.
 3. Each SQL statement is validated server-side before it runs: only a single read-only `SELECT`/`WITH` statement is allowed — no `INSERT`/`UPDATE`/`DELETE`/`DROP`/`ATTACH`/etc. The DuckDB connection also attaches the underlying SQLite file in read-only mode as a second layer of defense.
-4. Claude can call the tool multiple times to explore before committing to a final answer.
+4. The model can call the tool multiple times to explore before committing to a final answer.
 5. The API returns the natural-language answer, the SQL that produced it, and the result rows — the frontend renders all three.
 
 ## Project structure
@@ -170,7 +137,7 @@ Good questions to try (these force joins/aggregations, which shows off the SQL g
 ```
 app/
   database.py   # DuckDB connection, schema introspection, query validation/execution
-  llm.py        # system prompt + Claude tool-use loop
+  llm.py        # system prompt + tool-use loop for both the Anthropic and Ollama backends
   main.py       # FastAPI routes
 static/
   index.html    # frontend (vanilla JS, no build step)
