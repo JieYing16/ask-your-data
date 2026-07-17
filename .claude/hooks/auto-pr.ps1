@@ -56,7 +56,9 @@ $diff
 "@
         $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
         try {
-            $result = claude -p $prompt --tools "" --output-format text `
+            # Force stdin closed rather than inheriting the hook's own stdin pipe,
+            # which otherwise makes claude.exe stall for a few seconds probing it.
+            $result = $null | claude -p $prompt --tools "" --output-format text `
                 --max-budget-usd 0.50 --no-session-persistence 2>$null
         } finally {
             Remove-Item Env:\CLAUDE_AUTO_PR_HOOK_RUNNING -ErrorAction SilentlyContinue
@@ -76,7 +78,7 @@ function Invoke-CodeReview {
     try {
         $env:CLAUDE_AUTO_PR_HOOK_RUNNING = '1'
         try {
-            claude -p "/code-review $reviewEffort --comment" `
+            $null | claude -p "/code-review $reviewEffort --comment" `
                 --append-system-prompt "You are a rigorous senior code reviewer holding this PR to a high standard of clean, effective, maintainable code. Flag anything that falls short." `
                 --permission-mode bypassPermissions `
                 --output-format text `
