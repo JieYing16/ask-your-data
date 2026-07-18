@@ -24,6 +24,17 @@ if ($branch -ne 'master' -and $branch -notlike 'claude/auto-*') {
     exit 0
 }
 
+function Test-OllamaAvailable {
+    # Cheap reachability check so we can warn once up front instead of letting
+    # every Invoke-Ollama call fail silently and time out one by one (see issue #6).
+    try {
+        Invoke-RestMethod -Uri "$ollamaHost/api/tags" -Method Get -TimeoutSec 5 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-Ollama($systemPrompt, $userPrompt, $schema) {
     $payload = @{
         model    = $ollamaModel
@@ -213,8 +224,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
 
     if ($needsNewBranch) {
+        # Check once, up front, rather than letting the description draft and
+        # every per-file review call each independently fail and time out.
+        $ollamaAvailable = Test-OllamaAvailable
+        $ollamaNote = ''
+        if (-not $ollamaAvailable) {
+            $ollamaNote = " Ollama ($ollamaHost) was unreachable, so the PR got a generic description and no automated code review ran. Start Ollama (ollama serve) with the $ollamaModel model pulled to enable both."
+            Write-Output "Warning: Ollama ($ollamaHost) is unreachable -- skipping PR description drafting and code review for this PR."
+        }
+
         $diff = (git diff "$diffBase...HEAD" | Out-String)
-        $body = New-PrBody $diff
+        $body = if ($ollamaAvailable) { New-PrBody $diff } else { $null }
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
         }
@@ -225,10 +245,10 @@ try {
         $headSha = (git rev-parse HEAD).Trim()
         $repoSlug = gh repo view --json nameWithOwner -q .nameWithOwner 2>$null
         $reviewCount = 0
-        if ($prNumber -and $repoSlug) {
+        if ($ollamaAvailable -and $prNumber -and $repoSlug) {
             $reviewCount = Invoke-CodeReview -prNumber $prNumber -diffBase $diffBase -headSha $headSha -repoSlug $repoSlug
         }
-        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).")
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).$ollamaNote")
     } else {
         Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
     }
