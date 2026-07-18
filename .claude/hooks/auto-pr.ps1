@@ -13,6 +13,37 @@ function Emit($msg) {
     (@{ systemMessage = $msg } | ConvertTo-Json -Compress)
 }
 
+# CLAUDE_AUTO_PR_DEBUG=1 keeps command output instead of the usual *>$null
+# suppression, so a step that fails for a non-obvious reason is diagnosable
+# (see issue #7). $script:stepLog records one entry per major step -- commit,
+# push, PR creation, code review -- so both the success message and any
+# thrown error can report what actually happened, not just where it stopped.
+$debugMode = [bool]($env:CLAUDE_AUTO_PR_DEBUG)
+$script:stepLog = New-Object System.Collections.Generic.List[string]
+
+function Invoke-Step {
+    param(
+        [string]$Name,
+        [ScriptBlock]$Action,
+        [switch]$Critical
+    )
+    $output = & $Action 2>&1
+    $ok = ($LASTEXITCODE -eq 0)
+    if ($debugMode) {
+        Write-Output "[debug] $Name (exit $LASTEXITCODE):`n$output"
+    }
+    $script:stepLog.Add("$Name=$(if ($ok) { 'ok' } elseif ($Critical) { 'FAILED' } else { 'failed-continued' })")
+    if (-not $ok -and $Critical) {
+        throw "$Name failed: $output"
+    }
+    return $output
+}
+
+function Get-StepSummary {
+    if ($script:stepLog.Count -eq 0) { return '' }
+    return " [steps: $($script:stepLog -join ', ')]"
+}
+
 $statusLines = git status --porcelain
 if (-not $statusLines) {
     exit 0
@@ -202,15 +233,13 @@ try {
     }
 
     git add -A
-    git commit -m "Automated commit from Claude Code session" *>$null
-    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    Invoke-Step -Name 'git-commit' -Critical -Action { git commit -m "Automated commit from Claude Code session" }
 
     if ($needsNewBranch) {
-        git push -u origin $branch *>$null
+        Invoke-Step -Name 'git-push' -Critical -Action { git push -u origin $branch }
     } else {
-        git push *>$null
+        Invoke-Step -Name 'git-push' -Critical -Action { git push }
     }
-    if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
 
     if ($needsNewBranch) {
         $diff = (git diff "$diffBase...HEAD" | Out-String)
@@ -218,21 +247,22 @@ try {
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
         }
-        gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef *>$null
-        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed for $branch (branch was pushed)" }
+        Invoke-Step -Name 'pr-create' -Critical -Action { gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef }
 
         $prNumber = gh pr view $branch --json number -q .number 2>$null
         $headSha = (git rev-parse HEAD).Trim()
         $repoSlug = gh repo view --json nameWithOwner -q .nameWithOwner 2>$null
         $reviewCount = 0
         if ($prNumber -and $repoSlug) {
+            # Not critical: a code-review hiccup shouldn't undo an already-created PR.
             $reviewCount = Invoke-CodeReview -prNumber $prNumber -diffBase $diffBase -headSha $headSha -repoSlug $repoSlug
         }
-        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).")
+        $script:stepLog.Add("code-review=posted:$reviewCount")
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).$(Get-StepSummary)")
     } else {
-        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
+        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.$(Get-StepSummary)")
     }
 }
 catch {
-    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)")
+    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)$(Get-StepSummary)")
 }
