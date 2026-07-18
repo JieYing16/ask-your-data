@@ -24,6 +24,39 @@ if ($branch -ne 'master' -and $branch -notlike 'claude/auto-*') {
     exit 0
 }
 
+# Preflight (see issue #3): if gh isn't authenticated, every gh call below will
+# fail anyway -- bail out now with a clear message instead of committing and
+# pushing first and only then hitting a confusing "gh pr create failed".
+gh auth status *>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Output (Emit "Auto-PR hook: gh CLI is not authenticated (gh auth status failed) -- skipping automation. Run 'gh auth login' to fix.")
+    exit 0
+}
+
+function Invoke-GhWithRetry([ScriptBlock]$Command, [int]$MaxAttempts = 3) {
+    # Retries transient gh failures (network blips, rate-limiting) with
+    # exponential backoff. Auth failures are permanent -- retrying just delays
+    # the real error, so those fail fast after the first attempt.
+    $attempt = 0
+    $output = $null
+    while ($attempt -lt $MaxAttempts) {
+        $attempt++
+        $output = & $Command 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Success = $true; Output = $output; Attempts = $attempt }
+        }
+        if ("$output" -match 'authentication|auth login|401|not logged in|no pull requests found') {
+            # Permanent outcomes -- retrying won't change an auth failure or
+            # the fact that no PR exists for this branch.
+            break
+        }
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds ([math]::Pow(2, $attempt - 1))
+        }
+    }
+    return @{ Success = $false; Output = $output; Attempts = $attempt }
+}
+
 function Invoke-Ollama($systemPrompt, $userPrompt, $schema) {
     $payload = @{
         model    = $ollamaModel
@@ -176,8 +209,9 @@ try {
         # call (auth/network/rate-limit) is inconclusive, not evidence the PR is
         # closed -- treat it as "still open" and keep pushing here, rather than
         # risk orphaning a real open PR behind a duplicate branch.
-        $prState = gh pr view $branch --json state -q .state 2>$null
-        $prCheckFailed = ($LASTEXITCODE -ne 0)
+        $viewResult = Invoke-GhWithRetry { gh pr view $branch --json state -q .state }
+        $prState = $viewResult.Output
+        $prCheckFailed = -not $viewResult.Success
         if (-not $prCheckFailed -and $prState -ne 'OPEN') {
             $staleBranch = $branch
             git checkout master *>$null
@@ -218,8 +252,10 @@ try {
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
         }
-        gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef *>$null
-        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed for $branch (branch was pushed)" }
+        # Retry: this is the call that, if it fails, leaves an orphaned pushed
+        # branch behind (see issue #4's cleanup script for recovering those).
+        $createResult = Invoke-GhWithRetry { gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef }
+        if (-not $createResult.Success) { throw "gh pr create failed for $branch after $($createResult.Attempts) attempt(s) (branch was pushed): $($createResult.Output)" }
 
         $prNumber = gh pr view $branch --json number -q .number 2>$null
         $headSha = (git rev-parse HEAD).Trim()
