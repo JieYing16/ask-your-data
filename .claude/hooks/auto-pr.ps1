@@ -201,6 +201,41 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "could not create branch $branch" }
     }
 
+    # Opt-in safety valves (see issue #5): CLAUDE_AUTO_PR_DRY_RUN previews what
+    # would happen with no side effects; CLAUDE_AUTO_PR_INTERACTIVE pauses for a
+    # y/N before anything is committed or pushed. Both default to off so existing
+    # non-interactive workflows are unaffected.
+    $dryRun = [bool]($env:CLAUDE_AUTO_PR_DRY_RUN)
+    $interactive = [bool]($env:CLAUDE_AUTO_PR_INTERACTIVE)
+
+    if ($dryRun -or $interactive) {
+        $changeLines = ($statusLines | ForEach-Object { "    $_" }) -join "`n"
+        $branchLine = if ($needsNewBranch) { "$branch (new, based on $baseRef)" } else { "$branch (existing, pushing more commits)" }
+        Write-Output "Auto-PR hook would now commit and push to:`n  $branchLine`n`nChanges:`n$changeLines"
+
+        if ($dryRun) {
+            if ($needsNewBranch) {
+                # Undo the local branch cut above -- dry-run promises no side effects.
+                git checkout master *>$null
+                git branch -D $branch *>$null
+            }
+            Write-Output (Emit "Auto-PR hook: dry run (CLAUDE_AUTO_PR_DRY_RUN set) -- no commit, push, or PR was created.")
+            exit 0
+        }
+
+        if ($interactive) {
+            $answer = Read-Host 'Proceed with commit, push, and PR creation? [y/N]'
+            if ($answer -notmatch '^y(es)?$') {
+                if ($needsNewBranch) {
+                    git checkout master *>$null
+                    git branch -D $branch *>$null
+                }
+                Write-Output (Emit 'Auto-PR hook: cancelled (CLAUDE_AUTO_PR_INTERACTIVE) -- no commit, push, or PR was created.')
+                exit 0
+            }
+        }
+    }
+
     git add -A
     git commit -m "Automated commit from Claude Code session" *>$null
     if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
