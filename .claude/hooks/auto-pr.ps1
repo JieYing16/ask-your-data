@@ -13,6 +13,37 @@ function Emit($msg) {
     (@{ systemMessage = $msg } | ConvertTo-Json -Compress)
 }
 
+# CLAUDE_AUTO_PR_DEBUG=1 keeps command output instead of the usual *>$null
+# suppression, so a step that fails for a non-obvious reason is diagnosable
+# (see issue #7). $script:stepLog records one entry per major step -- commit,
+# push, PR creation, code review -- so both the success message and any
+# thrown error can report what actually happened, not just where it stopped.
+$debugMode = [bool]($env:CLAUDE_AUTO_PR_DEBUG)
+$script:stepLog = New-Object System.Collections.Generic.List[string]
+
+function Invoke-Step {
+    param(
+        [string]$Name,
+        [ScriptBlock]$Action,
+        [switch]$Critical
+    )
+    $output = & $Action 2>&1
+    $ok = ($LASTEXITCODE -eq 0)
+    if ($debugMode) {
+        Write-Output "[debug] $Name (exit $LASTEXITCODE):`n$output"
+    }
+    $script:stepLog.Add("$Name=$(if ($ok) { 'ok' } elseif ($Critical) { 'FAILED' } else { 'failed-continued' })")
+    if (-not $ok -and $Critical) {
+        throw "$Name failed: $output"
+    }
+    return $output
+}
+
+function Get-StepSummary {
+    if ($script:stepLog.Count -eq 0) { return '' }
+    return " [steps: $($script:stepLog -join ', ')]"
+}
+
 $statusLines = git status --porcelain
 if (-not $statusLines) {
     exit 0
@@ -22,6 +53,50 @@ $branch = (git rev-parse --abbrev-ref HEAD).Trim()
 
 if ($branch -ne 'master' -and $branch -notlike 'claude/auto-*') {
     exit 0
+}
+
+# Preflight (see issue #3): if gh isn't authenticated, every gh call below will
+# fail anyway -- bail out now with a clear message instead of committing and
+# pushing first and only then hitting a confusing "gh pr create failed".
+gh auth status *>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Output (Emit "Auto-PR hook: gh CLI is not authenticated (gh auth status failed) -- skipping automation. Run 'gh auth login' to fix.")
+    exit 0
+}
+
+function Invoke-GhWithRetry([ScriptBlock]$Command, [int]$MaxAttempts = 3) {
+    # Retries transient gh failures (network blips, rate-limiting) with
+    # exponential backoff. Auth failures are permanent -- retrying just delays
+    # the real error, so those fail fast after the first attempt.
+    $attempt = 0
+    $output = $null
+    while ($attempt -lt $MaxAttempts) {
+        $attempt++
+        $output = & $Command 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Success = $true; Output = $output; Attempts = $attempt }
+        }
+        if ("$output" -match 'authentication|auth login|401|not logged in|no pull requests found') {
+            # Permanent outcomes -- retrying won't change an auth failure or
+            # the fact that no PR exists for this branch.
+            break
+        }
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds ([math]::Pow(2, $attempt - 1))
+        }
+    }
+    return @{ Success = $false; Output = $output; Attempts = $attempt }
+}
+
+function Test-OllamaAvailable {
+    # Cheap reachability check so we can warn once up front instead of letting
+    # every Invoke-Ollama call fail silently and time out one by one (see issue #6).
+    try {
+        Invoke-RestMethod -Uri "$ollamaHost/api/tags" -Method Get -TimeoutSec 5 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Invoke-Ollama($systemPrompt, $userPrompt, $schema) {
@@ -176,8 +251,9 @@ try {
         # call (auth/network/rate-limit) is inconclusive, not evidence the PR is
         # closed -- treat it as "still open" and keep pushing here, rather than
         # risk orphaning a real open PR behind a duplicate branch.
-        $prState = gh pr view $branch --json state -q .state 2>$null
-        $prCheckFailed = ($LASTEXITCODE -ne 0)
+        $viewResult = Invoke-GhWithRetry { gh pr view $branch --json state -q .state }
+        $prState = $viewResult.Output
+        $prCheckFailed = -not $viewResult.Success
         if (-not $prCheckFailed -and $prState -ne 'OPEN') {
             $staleBranch = $branch
             git checkout master *>$null
@@ -201,38 +277,82 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "could not create branch $branch" }
     }
 
-    git add -A
-    git commit -m "Automated commit from Claude Code session" *>$null
-    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    # Opt-in safety valves (see issue #5): CLAUDE_AUTO_PR_DRY_RUN previews what
+    # would happen with no side effects; CLAUDE_AUTO_PR_INTERACTIVE pauses for a
+    # y/N before anything is committed or pushed. Both default to off so existing
+    # non-interactive workflows are unaffected.
+    $dryRun = [bool]($env:CLAUDE_AUTO_PR_DRY_RUN)
+    $interactive = [bool]($env:CLAUDE_AUTO_PR_INTERACTIVE)
 
-    if ($needsNewBranch) {
-        git push -u origin $branch *>$null
-    } else {
-        git push *>$null
+    if ($dryRun -or $interactive) {
+        $changeLines = ($statusLines | ForEach-Object { "    $_" }) -join "`n"
+        $branchLine = if ($needsNewBranch) { "$branch (new, based on $baseRef)" } else { "$branch (existing, pushing more commits)" }
+        Write-Output "Auto-PR hook would now commit and push to:`n  $branchLine`n`nChanges:`n$changeLines"
+
+        if ($dryRun) {
+            if ($needsNewBranch) {
+                # Undo the local branch cut above -- dry-run promises no side effects.
+                git checkout master *>$null
+                git branch -D $branch *>$null
+            }
+            Write-Output (Emit "Auto-PR hook: dry run (CLAUDE_AUTO_PR_DRY_RUN set) -- no commit, push, or PR was created.")
+            exit 0
+        }
+
+        if ($interactive) {
+            $answer = Read-Host 'Proceed with commit, push, and PR creation? [y/N]'
+            if ($answer -notmatch '^y(es)?$') {
+                if ($needsNewBranch) {
+                    git checkout master *>$null
+                    git branch -D $branch *>$null
+                }
+                Write-Output (Emit 'Auto-PR hook: cancelled (CLAUDE_AUTO_PR_INTERACTIVE) -- no commit, push, or PR was created.')
+                exit 0
+            }
+        }
     }
-    if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
+
+    git add -A
+    Invoke-Step -Name 'git-commit' -Critical -Action { git commit -m "Automated commit from Claude Code session" }
 
     if ($needsNewBranch) {
+        Invoke-Step -Name 'git-push' -Critical -Action { git push -u origin $branch }
+    } else {
+        Invoke-Step -Name 'git-push' -Critical -Action { git push }
+    }
+
+    if ($needsNewBranch) {
+        # Check once, up front, rather than letting the description draft and
+        # every per-file review call each independently fail and time out.
+        $ollamaAvailable = Test-OllamaAvailable
+        $ollamaNote = ''
+        if (-not $ollamaAvailable) {
+            $ollamaNote = " Ollama ($ollamaHost) was unreachable, so the PR got a generic description and no automated code review ran. Start Ollama (ollama serve) with the $ollamaModel model pulled to enable both."
+            Write-Output "Warning: Ollama ($ollamaHost) is unreachable -- skipping PR description drafting and code review for this PR."
+        }
+
         $diff = (git diff "$diffBase...HEAD" | Out-String)
-        $body = New-PrBody $diff
+        $body = if ($ollamaAvailable) { New-PrBody $diff } else { $null }
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
         }
-        gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef *>$null
-        if ($LASTEXITCODE -ne 0) { throw "gh pr create failed for $branch (branch was pushed)" }
+        # Retry: this is the call that, if it fails, leaves an orphaned pushed
+        # branch behind (see issue #4's cleanup script for recovering those).
+        $createResult = Invoke-GhWithRetry { gh pr create --title "Automated changes ($branch)" --body $body --head $branch --base $baseRef }
+        if (-not $createResult.Success) { throw "gh pr create failed for $branch after $($createResult.Attempts) attempt(s) (branch was pushed): $($createResult.Output)" }
 
         $prNumber = gh pr view $branch --json number -q .number 2>$null
         $headSha = (git rev-parse HEAD).Trim()
         $repoSlug = gh repo view --json nameWithOwner -q .nameWithOwner 2>$null
         $reviewCount = 0
-        if ($prNumber -and $repoSlug) {
+        if ($ollamaAvailable -and $prNumber -and $repoSlug) {
             $reviewCount = Invoke-CodeReview -prNumber $prNumber -diffBase $diffBase -headSha $headSha -repoSlug $repoSlug
         }
-        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).")
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).$ollamaNote")
     } else {
-        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
+        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.$(Get-StepSummary)")
     }
 }
 catch {
-    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)")
+    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)$(Get-StepSummary)")
 }
