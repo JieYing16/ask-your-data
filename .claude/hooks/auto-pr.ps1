@@ -57,6 +57,17 @@ function Invoke-GhWithRetry([ScriptBlock]$Command, [int]$MaxAttempts = 3) {
     return @{ Success = $false; Output = $output; Attempts = $attempt }
 }
 
+function Test-OllamaAvailable {
+    # Cheap reachability check so we can warn once up front instead of letting
+    # every Invoke-Ollama call fail silently and time out one by one (see issue #6).
+    try {
+        Invoke-RestMethod -Uri "$ollamaHost/api/tags" -Method Get -TimeoutSec 5 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-Ollama($systemPrompt, $userPrompt, $schema) {
     $payload = @{
         model    = $ollamaModel
@@ -235,6 +246,41 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "could not create branch $branch" }
     }
 
+    # Opt-in safety valves (see issue #5): CLAUDE_AUTO_PR_DRY_RUN previews what
+    # would happen with no side effects; CLAUDE_AUTO_PR_INTERACTIVE pauses for a
+    # y/N before anything is committed or pushed. Both default to off so existing
+    # non-interactive workflows are unaffected.
+    $dryRun = [bool]($env:CLAUDE_AUTO_PR_DRY_RUN)
+    $interactive = [bool]($env:CLAUDE_AUTO_PR_INTERACTIVE)
+
+    if ($dryRun -or $interactive) {
+        $changeLines = ($statusLines | ForEach-Object { "    $_" }) -join "`n"
+        $branchLine = if ($needsNewBranch) { "$branch (new, based on $baseRef)" } else { "$branch (existing, pushing more commits)" }
+        Write-Output "Auto-PR hook would now commit and push to:`n  $branchLine`n`nChanges:`n$changeLines"
+
+        if ($dryRun) {
+            if ($needsNewBranch) {
+                # Undo the local branch cut above -- dry-run promises no side effects.
+                git checkout master *>$null
+                git branch -D $branch *>$null
+            }
+            Write-Output (Emit "Auto-PR hook: dry run (CLAUDE_AUTO_PR_DRY_RUN set) -- no commit, push, or PR was created.")
+            exit 0
+        }
+
+        if ($interactive) {
+            $answer = Read-Host 'Proceed with commit, push, and PR creation? [y/N]'
+            if ($answer -notmatch '^y(es)?$') {
+                if ($needsNewBranch) {
+                    git checkout master *>$null
+                    git branch -D $branch *>$null
+                }
+                Write-Output (Emit 'Auto-PR hook: cancelled (CLAUDE_AUTO_PR_INTERACTIVE) -- no commit, push, or PR was created.')
+                exit 0
+            }
+        }
+    }
+
     git add -A
     git commit -m "Automated commit from Claude Code session" *>$null
     if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
@@ -247,8 +293,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
 
     if ($needsNewBranch) {
+        # Check once, up front, rather than letting the description draft and
+        # every per-file review call each independently fail and time out.
+        $ollamaAvailable = Test-OllamaAvailable
+        $ollamaNote = ''
+        if (-not $ollamaAvailable) {
+            $ollamaNote = " Ollama ($ollamaHost) was unreachable, so the PR got a generic description and no automated code review ran. Start Ollama (ollama serve) with the $ollamaModel model pulled to enable both."
+            Write-Output "Warning: Ollama ($ollamaHost) is unreachable -- skipping PR description drafting and code review for this PR."
+        }
+
         $diff = (git diff "$diffBase...HEAD" | Out-String)
-        $body = New-PrBody $diff
+        $body = if ($ollamaAvailable) { New-PrBody $diff } else { $null }
         if (-not $body) {
             $body = "Automated PR opened by a Claude Code hook after changes were made in this repo.`n`nReview and merge (or close) as appropriate."
         }
@@ -261,10 +316,10 @@ try {
         $headSha = (git rev-parse HEAD).Trim()
         $repoSlug = gh repo view --json nameWithOwner -q .nameWithOwner 2>$null
         $reviewCount = 0
-        if ($prNumber -and $repoSlug) {
+        if ($ollamaAvailable -and $prNumber -and $repoSlug) {
             $reviewCount = Invoke-CodeReview -prNumber $prNumber -diffBase $diffBase -headSha $headSha -repoSlug $repoSlug
         }
-        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).")
+        Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).$ollamaNote")
     } else {
         Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
     }
