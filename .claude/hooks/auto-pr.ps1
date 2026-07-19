@@ -13,6 +13,37 @@ function Emit($msg) {
     (@{ systemMessage = $msg } | ConvertTo-Json -Compress)
 }
 
+# CLAUDE_AUTO_PR_DEBUG=1 keeps command output instead of the usual *>$null
+# suppression, so a step that fails for a non-obvious reason is diagnosable
+# (see issue #7). $script:stepLog records one entry per major step -- commit,
+# push, PR creation, code review -- so both the success message and any
+# thrown error can report what actually happened, not just where it stopped.
+$debugMode = [bool]($env:CLAUDE_AUTO_PR_DEBUG)
+$script:stepLog = New-Object System.Collections.Generic.List[string]
+
+function Invoke-Step {
+    param(
+        [string]$Name,
+        [ScriptBlock]$Action,
+        [switch]$Critical
+    )
+    $output = & $Action 2>&1
+    $ok = ($LASTEXITCODE -eq 0)
+    if ($debugMode) {
+        Write-Output "[debug] $Name (exit $LASTEXITCODE):`n$output"
+    }
+    $script:stepLog.Add("$Name=$(if ($ok) { 'ok' } elseif ($Critical) { 'FAILED' } else { 'failed-continued' })")
+    if (-not $ok -and $Critical) {
+        throw "$Name failed: $output"
+    }
+    return $output
+}
+
+function Get-StepSummary {
+    if ($script:stepLog.Count -eq 0) { return '' }
+    return " [steps: $($script:stepLog -join ', ')]"
+}
+
 $statusLines = git status --porcelain
 if (-not $statusLines) {
     exit 0
@@ -282,15 +313,13 @@ try {
     }
 
     git add -A
-    git commit -m "Automated commit from Claude Code session" *>$null
-    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    Invoke-Step -Name 'git-commit' -Critical -Action { git commit -m "Automated commit from Claude Code session" }
 
     if ($needsNewBranch) {
-        git push -u origin $branch *>$null
+        Invoke-Step -Name 'git-push' -Critical -Action { git push -u origin $branch }
     } else {
-        git push *>$null
+        Invoke-Step -Name 'git-push' -Critical -Action { git push }
     }
-    if ($LASTEXITCODE -ne 0) { throw "git push failed for $branch" }
 
     if ($needsNewBranch) {
         # Check once, up front, rather than letting the description draft and
@@ -321,9 +350,9 @@ try {
         }
         Write-Output (Emit "Auto-PR hook: opened branch $branch, drafted a PR description, and posted $reviewCount free local code-review comment(s).$ollamaNote")
     } else {
-        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.")
+        Write-Output (Emit "Auto-PR hook: pushed more changes to $branch.$(Get-StepSummary)")
     }
 }
 catch {
-    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)")
+    Write-Output (Emit "Auto-PR hook failed: $($_.Exception.Message)$(Get-StepSummary)")
 }
