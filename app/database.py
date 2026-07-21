@@ -18,9 +18,11 @@ _FORBIDDEN = re.compile(
 )
 
 # The schema is static per process, and a single DuckDB connection can be reused
-# across all requests, so we compute each once and guard the shared connection
-# with a lock (DuckDB connections are not safe for concurrent use).
+# across all requests, so we compute each once and guard the shared state with
+# locks (DuckDB connections are not safe for concurrent use, and /api/ask is a
+# sync endpoint so requests arrive on different threadpool threads).
 _schema_ddl_cache: str | None = None
+_schema_lock = threading.Lock()
 _duckdb_con: duckdb.DuckDBPyConnection | None = None
 _duckdb_lock = threading.Lock()
 
@@ -37,13 +39,17 @@ def get_schema_ddl() -> str:
     """
     global _schema_ddl_cache
     if _schema_ddl_cache is None:
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name")
-            _schema_ddl_cache = "\n\n".join(row[0] for row in cur.fetchall() if row[0])
-        finally:
-            conn.close()
+        with _schema_lock:
+            # Double-checked: another thread may have filled the cache while we
+            # were waiting on the lock.
+            if _schema_ddl_cache is None:
+                conn = sqlite3.connect(DB_PATH)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name")
+                    _schema_ddl_cache = "\n\n".join(row[0] for row in cur.fetchall() if row[0])
+                finally:
+                    conn.close()
     return _schema_ddl_cache
 
 
@@ -92,6 +98,10 @@ def execute_query(sql: str) -> dict:
     """Validate and run a SELECT query, returning columns, rows, and row count."""
     cleaned = validate_select(sql)
     started = time.perf_counter()
+    # The lock serializes all queries process-wide. Queries here are read-only and
+    # typically single-digit milliseconds, so this is a deliberate simplicity/reuse
+    # trade-off; if query concurrency ever matters, switch to a cursor per call
+    # (_duckdb_con.cursor()), which shares the attached DB without a global lock.
     with _duckdb_lock:
         con = _get_connection()
         try:
