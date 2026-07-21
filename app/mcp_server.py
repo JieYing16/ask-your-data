@@ -30,6 +30,8 @@ Because DB_PATH is honored by `app.database`, the same server points at any
 SQLite database without code changes.
 """
 
+import logging
+
 from mcp.server.fastmcp import FastMCP
 
 from app.database import DB_PATH, MAX_ROWS, QueryError, execute_query, get_schema_ddl, list_tables
@@ -51,6 +53,8 @@ def execute_sql(query: str) -> dict:
         return execute_query(query)
     except QueryError as exc:
         return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the agent as data, not a crash
+        return {"error": f"Unexpected error: {exc}"}
 
 
 @mcp.tool()
@@ -79,4 +83,8 @@ def ask(question: str) -> str:
 
 
 if __name__ == "__main__":
+    # Configure logging here (not at import) so the timing logs in app.database
+    # are visible when the server is run standalone; importing this module must
+    # not reconfigure a host application's logging.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     mcp.run()
