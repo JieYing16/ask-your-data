@@ -10,12 +10,17 @@ logger = logging.getLogger("ask_your_data.llm")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
 MAX_TOOL_ITERATIONS = 4
 
+# One-line description of the dataset, injected into the prompt so the model knows
+# the domain. Override via DB_DESCRIPTION when pointing at a non-Chinook database.
+DB_DESCRIPTION = os.environ.get(
+    "DB_DESCRIPTION", 'the "Chinook" digital music store database'
+).strip()
+
 SQL_TOOL_NAME = "execute_sql"
 SQL_TOOL_DESCRIPTION = (
-    "Run a single read-only SQL SELECT statement against the Chinook digital "
-    "music store database and return the resulting rows. Use this to explore "
-    "the data and to compute the final answer. Only SELECT/WITH statements "
-    "are permitted."
+    f"Run a single read-only SQL SELECT statement against {DB_DESCRIPTION} and "
+    "return the resulting rows. Use this to explore the data and to compute the "
+    "final answer. Only SELECT/WITH statements are permitted."
 )
 SQL_TOOL_INPUT_SCHEMA = {
     "type": "object",
@@ -31,7 +36,7 @@ SQL_TOOL_INPUT_SCHEMA = {
 
 def _system_prompt() -> str:
     schema = get_schema_ddl()
-    return f"""You are a data analyst assistant for the "Chinook" digital music store database.
+    return f"""You are a data analyst assistant for {DB_DESCRIPTION}.
 
 You answer natural-language questions by writing and running SQL SELECT queries \
 against the database via the execute_sql tool, then explaining the result in plain \
@@ -44,8 +49,7 @@ Database schema (SQLite DDL):
 Rules:
 - Always call execute_sql at least once before answering — never guess at numbers.
 - Only SELECT/WITH statements are allowed; the tool rejects anything else.
-- Table and column names are case-sensitive and use the exact names in the schema \
-above (e.g. "Customer", "InvoiceLine").
+- Table and column names are case-sensitive; use the exact names in the schema above.
 - Prefer aggregate queries (COUNT, SUM, AVG, GROUP BY) over pulling raw rows when the \
 question asks for a total, ranking, or comparison.
 - Add a LIMIT clause when a query could return many rows and only the top results matter.
