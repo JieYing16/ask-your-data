@@ -1,7 +1,11 @@
 import json
+import logging
 import os
+import time
 
 from app.database import QueryError, execute_query, get_schema_ddl
+
+logger = logging.getLogger("ask_your_data.llm")
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
 MAX_TOOL_ITERATIONS = 4
@@ -92,18 +96,21 @@ def _ask_anthropic(question: str) -> dict:
     }
 
     client = anthropic.Anthropic()
+    system_prompt = _system_prompt()
     messages: list[dict] = [{"role": "user", "content": question}]
     executed_queries: list[dict] = []
     last_successful_query: dict | None = None
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    for i in range(MAX_TOOL_ITERATIONS):
+        started = time.perf_counter()
         response = client.messages.create(
             model=model_name,
             max_tokens=1500,
-            system=_system_prompt(),
+            system=system_prompt,
             tools=[tool],
             messages=messages,
         )
+        logger.info("anthropic call %d took %.2f s", i + 1, time.perf_counter() - started)
 
         if response.stop_reason != "tool_use":
             answer = "".join(b.text for b in response.content if b.type == "text").strip()
@@ -165,8 +172,10 @@ def _ask_ollama(question: str) -> dict:
     executed_queries: list[dict] = []
     last_successful_query: dict | None = None
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    for i in range(MAX_TOOL_ITERATIONS):
+        started = time.perf_counter()
         response = client.chat(model=model_name, messages=messages, tools=[tool])
+        logger.info("ollama call %d took %.2f s", i + 1, time.perf_counter() - started)
         message = response["message"]
         tool_calls = message.get("tool_calls") or []
 

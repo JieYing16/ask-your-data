@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -7,6 +8,8 @@ from pydantic import BaseModel
 
 from app.database import list_tables
 from app.llm import ask_question
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
