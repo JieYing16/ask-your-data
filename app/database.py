@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -9,7 +10,10 @@ import duckdb
 
 logger = logging.getLogger("ask_your_data.database")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "chinook.db"
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "chinook.db"
+# Point at any SQLite database by setting DB_PATH. The schema is read dynamically
+# from the file, so a different database needs no code changes here.
+DB_PATH = Path(os.environ.get("DB_PATH") or _DEFAULT_DB_PATH).resolve()
 MAX_ROWS = 200
 
 _FORBIDDEN = re.compile(
@@ -74,8 +78,8 @@ def _get_connection() -> duckdb.DuckDBPyConnection:
     if _duckdb_con is None:
         con = duckdb.connect()
         con.execute("INSTALL sqlite; LOAD sqlite;")
-        con.execute(f"ATTACH '{DB_PATH.as_posix()}' AS chinook (TYPE sqlite, READ_ONLY)")
-        con.execute("USE chinook")
+        con.execute(f"ATTACH '{DB_PATH.as_posix()}' AS db (TYPE sqlite, READ_ONLY)")
+        con.execute("USE db")
         _duckdb_con = con
     return _duckdb_con
 
