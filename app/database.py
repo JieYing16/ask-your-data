@@ -10,10 +10,37 @@ import duckdb
 
 logger = logging.getLogger("ask_your_data.database")
 
-_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "chinook.db"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DB_PATH = _REPO_ROOT / "data" / "chinook.db"
+
+
+def _resolve_db_path() -> Path:
+    """Resolve DB_PATH to a concrete SQLite file, failing fast if it's missing.
+
+    A relative DB_PATH is resolved against the repo root (not the process CWD) so
+    it behaves the same however the server is launched. We validate existence up
+    front because sqlite3.connect() would otherwise silently *create* an empty
+    database for a wrong/typo'd path, yielding an empty schema and confusing
+    "no such table" errors on every query.
+    """
+    raw = os.environ.get("DB_PATH")
+    if not raw:
+        return _DEFAULT_DB_PATH
+    path = Path(raw)
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"DB_PATH points at '{path}', which is not an existing file. Set DB_PATH "
+            f"to a valid SQLite database (see .env.example)."
+        )
+    return path
+
+
 # Point at any SQLite database by setting DB_PATH. The schema is read dynamically
 # from the file, so a different database needs no code changes here.
-DB_PATH = Path(os.environ.get("DB_PATH") or _DEFAULT_DB_PATH).resolve()
+DB_PATH = _resolve_db_path()
 MAX_ROWS = 200
 
 _FORBIDDEN = re.compile(
